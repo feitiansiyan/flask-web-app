@@ -1,0 +1,108 @@
+name: Deploy Flask App to Touge Server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: touge-flask-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies and run tests
+        run: |
+          python -m pip install -r requirements.txt pytest==8.4.1
+          python -m pytest tests/ -v
+
+      - name: Deploy to Touge server
+        env:
+          TOUGE_SSH_PRIVATE_KEY: ${{ secrets.TOUGE_SSH_PRIVATE_KEY }}
+          TOUGE_SERVER_IP: ${{ secrets.TOUGE_SERVER_IP }}
+          TOUGE_SSH_PORT: ${{ secrets.TOUGE_SSH_PORT }}
+          TOUGE_SSH_USER: ${{ secrets.TOUGE_SSH_USER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${TOUGE_SSH_PRIVATE_KEY:?Missing TOUGE_SSH_PRIVATE_KEY}"
+          : "${TOUGE_SERVER_IP:?Missing TOUGE_SERVER_IP}"
+          : "${TOUGE_SSH_PORT:?Missing TOUGE_SSH_PORT}"
+          : "${TOUGE_SSH_USER:?Missing TOUGE_SSH_USER}"
+
+          install -m 700 -d ~/.ssh
+          trap 'rm -f ~/.ssh/touge_flask_rsa' EXIT
+          printf '%s\n' "$TOUGE_SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/touge_flask_rsa
+          chmod 600 ~/.ssh/touge_flask_rsa
+
+          # Compare the server key with the fingerprint verified in the lab terminal.
+          ssh-keyscan -T 15 -t ed25519 -p "$TOUGE_SSH_PORT" "$TOUGE_SERVER_IP" > ~/.ssh/touge_known_hosts
+          actual_fingerprint=$(ssh-keygen -lf ~/.ssh/touge_known_hosts -E sha256 | awk '{print $2}' | sort -u)
+          expected_fingerprint='SHA256:un18YqYqHsMwtY6var7mc35sMo7on1i863/aJl2DcFU'
+          if [ "$actual_fingerprint" != "$expected_fingerprint" ]; then
+            echo 'Server fingerprint changed. Verify it in the Touge terminal before updating this file.'
+            exit 1
+          fi
+
+          ssh -i ~/.ssh/touge_flask_rsa \
+            -p "$TOUGE_SSH_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=20 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/touge_known_hosts" \
+            -o HostKeyAlgorithms=ssh-ed25519 \
+            "$TOUGE_SSH_USER@$TOUGE_SERVER_IP" "bash -s -- $GITHUB_SHA" <<'REMOTE'
+          set -euo pipefail
+          cd /root/flask-web-app
+
+          # Deploy the commit that passed the GitHub tests.
+          git fetch origin main
+          git merge --ff-only "$1"
+          test "$(git rev-parse HEAD)" = "$1"
+
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m unittest discover -s tests -v
+          supervisorctl restart flask-web-app
+          supervisorctl status flask-web-app
+
+          .venv/bin/python - <<'PY'
+          import time
+          from urllib.request import urlopen
+          from src.app import app
+
+          with app.test_client() as client:
+              expected = client.get('/').data
+          for attempt in range(10):
+              try:
+                  with urlopen('http://127.0.0.1:5000/', timeout=5) as response:
+                      assert response.status == 200
+                      body = response.read()
+                      assert body == expected, 'The running page does not match the deployed code'
+                  print('Deployment verified:', body.decode('utf-8'))
+                  break
+              except Exception:
+                  if attempt == 9:
+                      raise
+                  time.sleep(1)
+          PY
+          REMOTE
